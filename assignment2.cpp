@@ -13,7 +13,7 @@ struct puzzleState{
     int g;
     int h;
 
-    puzzleState(): puzzle(N, vector<int>(N)){};
+    puzzleState(): puzzle(N, vector<int>(N)){}
 };
 
 void printPuzzle(const puzzleState &state){
