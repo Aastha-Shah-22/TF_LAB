@@ -1,254 +1,134 @@
 """
-secure_app.py
--------------
-Hardened Flask application for SAST testing.
+vulnerable_app.py
+-----------------
+Intentionally vulnerable Python file for SAST testing.
+DO NOT use in production.
+
+Vulnerabilities present:
+  V1  - SQL Injection (string-formatted query)
+  V2  - Command Injection (os.system with user input)
+  V3  - Hardcoded credentials
+  V4  - Path Traversal (unsanitized file path)
+  V5  - Insecure deserialization (pickle.loads on untrusted data)
+  V6  - Weak cryptography (MD5 for password hashing)
+  V7  - Open redirect
+  V8  - Debug mode enabled in production
+  V9  - SSRF (requests to user-supplied URL)
+  V10 - Sensitive data logged in plaintext
 """
 
-import ipaddress
-import logging
 import os
-import socket
 import sqlite3
+import pickle
+import hashlib
 import subprocess
-from pathlib import Path
-
-import bcrypt
+import logging
 import requests
-from flask import Flask, abort, redirect, request, send_file
-from lxml import etree
+from flask import Flask, request, redirect, send_file
 
 app = Flask(__name__)
 
-# ------------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------------
+# ------------------------------------------------------------------ #
+# V3 – Hardcoded credentials
+# ------------------------------------------------------------------ #
+DB_USER     = "admin"
+DB_PASSWORD = "SuperSecret123!"          # hardcoded password
+SECRET_KEY  = "hardcoded-secret-key"     # hardcoded Flask secret
 
-UPLOAD_DIR = Path("/var/app/uploads").resolve()
+app.secret_key = SECRET_KEY
 
-app.secret_key = os.environ.get("FLASK_SECRET_KEY")
-if not app.secret_key:
-    raise RuntimeError("FLASK_SECRET_KEY must be configured")
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-MAX_UPLOAD_SIZE = 1024 * 1024
-app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE
 
-# ------------------------------------------------------------------
-# Allowlists
-# ------------------------------------------------------------------
-
-SAFE_REDIRECTS = {
-    "home": "/",
-    "profile": "/profile",
-    "dashboard": "/dashboard",
-}
-
-SAFE_ENDPOINTS = {
-    "posts": "https://jsonplaceholder.typicode.com/posts",
-    "users": "https://jsonplaceholder.typicode.com/users",
-}
-
-# ------------------------------------------------------------------
-# Security Headers
-# ------------------------------------------------------------------
-
-@app.after_request
-def add_headers(response):
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Content-Security-Policy"] = "default-src 'self'"
-    return response
-
-# ------------------------------------------------------------------
-# Database
-# ------------------------------------------------------------------
-
+# ------------------------------------------------------------------ #
+# V1 – SQL Injection
+# ------------------------------------------------------------------ #
 def get_user(username: str):
     conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    # Dangerous: user input concatenated directly into the query
+    query = "SELECT * FROM users WHERE username = '" + username + "'"
+    cursor.execute(query)
+    return cursor.fetchone()
 
-    try:
-        cursor = conn.cursor()
 
-        cursor.execute(
-            "SELECT username,password FROM users WHERE username=?",
-            (username,),
-        )
-
-        return cursor.fetchone()
-
-    finally:
-        conn.close()
-
-# ------------------------------------------------------------------
-# Safe Ping
-# ------------------------------------------------------------------
-
+# ------------------------------------------------------------------ #
+# V2 – Command Injection
+# ------------------------------------------------------------------ #
 def ping_host(host: str):
+    # Dangerous: host is passed directly to the shell
+    os.system("ping -c 1 " + host)
 
-    try:
-        socket.gethostbyname(host)
-    except socket.gaierror:
-        raise ValueError("Invalid hostname")
 
-    subprocess.run(
-        ["ping", "-c", "1", host],
-        shell=False,
-        timeout=5,
-        check=False,
-    )
-
-# ------------------------------------------------------------------
-# Safe Download
-# ------------------------------------------------------------------
-
+# ------------------------------------------------------------------ #
+# V4 – Path Traversal
+# ------------------------------------------------------------------ #
 @app.route("/download")
-def download():
-
+def download_file():
     filename = request.args.get("file", "")
+    # Dangerous: no sanitisation; allows ../../etc/passwd
+    filepath = os.path.join("/var/app/uploads", filename)
+    return send_file(filepath)
 
-    if "/" in filename or "\\" in filename:
-        abort(400)
 
-    target = (UPLOAD_DIR / filename).resolve()
-
-    try:
-        target.relative_to(UPLOAD_DIR)
-    except ValueError:
-        abort(403)
-
-    if not target.is_file():
-        abort(404)
-
-    return send_file(target)
-
-# ------------------------------------------------------------------
-# JSON
-# ------------------------------------------------------------------
-
+# ------------------------------------------------------------------ #
+# V5 – Insecure Deserialization
+# ------------------------------------------------------------------ #
 @app.route("/load_session", methods=["POST"])
 def load_session():
+    data = request.get_data()
+    # Dangerous: deserializing arbitrary user-supplied bytes
+    session_obj = pickle.loads(data)
+    return str(session_obj)
 
-    data = request.get_json(silent=True)
 
-    if not isinstance(data, dict):
-        return "Invalid JSON", 400
+# ------------------------------------------------------------------ #
+# V6 – Weak cryptography (MD5 for passwords)
+# ------------------------------------------------------------------ #
+def hash_password(password: str) -> str:
+    # MD5 is cryptographically broken; never use for passwords
+    return hashlib.md5(password.encode()).hexdigest()
 
-    return data
 
-# ------------------------------------------------------------------
-# Password Hashing
-# ------------------------------------------------------------------
-
-def hash_password(password: str):
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-
-def check_password(password: str, hashed):
-
-    if isinstance(hashed, str):
-        hashed = hashed.encode()
-
-    return bcrypt.checkpw(password.encode(), hashed)
-
-# ------------------------------------------------------------------
-# Safe Redirect
-# ------------------------------------------------------------------
-
+# ------------------------------------------------------------------ #
+# V7 – Open Redirect
+# ------------------------------------------------------------------ #
 @app.route("/redirect")
-def safe_redirect():
+def open_redirect():
+    url = request.args.get("url", "/")
+    # Dangerous: no validation of destination URL
+    return redirect(url)
 
-    destination = request.args.get("dest", "home")
 
-    if destination not in SAFE_REDIRECTS:
-        abort(400)
-
-    return redirect(SAFE_REDIRECTS[destination])
-
-# ------------------------------------------------------------------
-# Fetch (No SSRF)
-# ------------------------------------------------------------------
-
+# ------------------------------------------------------------------ #
+# V9 – SSRF (Server-Side Request Forgery)
+# ------------------------------------------------------------------ #
 @app.route("/fetch")
-def fetch():
+def fetch_url():
+    target = request.args.get("url", "")
+    # Dangerous: allows internal network probing
+    response = requests.get(target)
+    return response.text
 
-    endpoint = request.args.get("endpoint")
 
-    if endpoint not in SAFE_ENDPOINTS:
-        abort(400)
-
-    response = requests.get(
-        SAFE_ENDPOINTS[endpoint],
-        timeout=5,
-        allow_redirects=False,
-    )
-
-    return response.text, response.status_code
-
-# ------------------------------------------------------------------
-# Login
-# ------------------------------------------------------------------
-
+# ------------------------------------------------------------------ #
+# V10 – Sensitive data logged in plaintext
+# ------------------------------------------------------------------ #
 @app.route("/login", methods=["POST"])
 def login():
-
-    username = request.form.get("username", "")
-    password = request.form.get("password", "")
-
-    logger.info("Login attempt")
-
+    username = request.form.get("username")
+    password = request.form.get("password")
+    # Dangerous: password written to log file in plaintext
+    logger.debug("Login attempt — user: %s  password: %s", username, password)
     user = get_user(username)
-
-    if not user:
-        return "Login failed", 401
-
-    if check_password(password, user[1]):
+    if user and user[2] == hash_password(password):
         return "Login successful"
-
     return "Login failed", 401
 
-# ------------------------------------------------------------------
-# XML
-# ------------------------------------------------------------------
 
-@app.route("/parse_xml", methods=["POST"])
-def parse_xml():
-
-    xml_data = request.get_data()
-
-    parser = etree.XMLParser(
-        resolve_entities=False,
-        load_dtd=False,
-        no_network=True,
-        huge_tree=False,
-    )
-
-    try:
-        root = etree.fromstring(xml_data, parser)
-    except etree.XMLSyntaxError:
-        return "Invalid XML", 400
-
-    item = root.find("item")
-
-    return item.text if item is not None else ""
-
-# ------------------------------------------------------------------
-# Health
-# ------------------------------------------------------------------
-
-@app.route("/")
-def home():
-    return "OK"
-
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
-
+# ------------------------------------------------------------------ #
+# V8 – Debug mode enabled (exposes interactive debugger)
+# ------------------------------------------------------------------ #
 if __name__ == "__main__":
-
-    app.run(
-        host="127.0.0.1",
-        port=5000,
-        debug=False,
-    )
+    app.run(debug=True, host="0.0.0.0", port=5000)   # debug=True in production
